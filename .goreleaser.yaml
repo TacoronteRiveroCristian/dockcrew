@@ -1,0 +1,29 @@
+# Config inicial para GoReleaser (plantilla mínima)
+project_name: dockcrew
+
+builds:
+  - id: dockcrew
+    main: ./cmd/dockcrew
+    env:
+      - CGO_ENABLED=0
+    flags: ["-trimpath"]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: archive
+    format: tar.gz
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+dockers:
+  - image_templates:
+      - ghcr.io/{{.ModulePath}}:{{.Version}}
+    dockerfile: Dockerfile
+    use: buildx
