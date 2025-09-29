@@ -10,7 +10,7 @@ build:
 	GOFLAGS="-trimpath" CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/dockcrew
 
 run: build
-	./bin/$(BINARY) --version
+	./bin/$(BINARY)
 
 clean:
 	rm -rf bin/ dist/ coverage.*
