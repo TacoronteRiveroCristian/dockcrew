@@ -3,9 +3,11 @@ package ui
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -37,9 +39,10 @@ type actionPrompt struct {
 }
 
 type containersMsg struct {
-	items []domain.Container
-	err   error
-	all   bool
+	items    []domain.Container
+	snapshot []domain.Container
+	err      error
+	all      bool
 }
 
 type refreshTickMsg time.Time
@@ -69,6 +72,7 @@ type model struct {
 
 	table         table.Model
 	containers    []domain.Container
+	allContainers []domain.Container
 	fetching      bool
 	showAll       bool
 	lastErr       error
@@ -81,6 +85,8 @@ type model struct {
 	notification  string
 	notifUntil    time.Time
 	notifKind     notificationKind
+	spinner       spinner.Model
+	selectedID    string
 }
 
 func newModel(client docker.Client) model {
@@ -96,15 +102,19 @@ func newModel(client docker.Client) model {
 	t.SetStyles(tableStyles())
 	t.SetHeight(12)
 	t.Focus()
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = spinnerStyle
 	return model{
 		client:       client,
 		table:        t,
 		refreshEvery: defaultRefreshInterval,
+		spinner:      sp,
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.loadContainers(), scheduleRefresh(m.refreshEvery))
+	return tea.Batch(m.spinner.Tick, m.loadContainers(), scheduleRefresh(m.refreshEvery))
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -118,10 +128,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.fetching = false
 		m.lastErr = msg.err
 		if msg.err == nil {
+			m.allContainers = cloneContainers(msg.snapshot)
 			m.containers = msg.items
 			m.statusLine = fmt.Sprintf("%d containers (%s)", len(msg.items), ternary(msg.all, "all", "running"))
 			m.lastUpdated = time.Now()
 			m.table.SetRows(buildRows(msg.items))
+			m.ensureSelection()
 		}
 		return m, scheduleRefresh(m.refreshEvery)
 	case refreshTickMsg:
@@ -144,6 +156,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.loadContainers())
 		}
 		return m, tea.Batch(cmds...)
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
 	case tea.KeyMsg:
 		if m.pendingAction != nil {
 			switch msg.String() {
@@ -168,6 +184,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "a":
 			if !m.fetching {
 				m.showAll = !m.showAll
+				m.containers = filterContainers(m.allContainers, m.showAll)
+				m.table.SetRows(buildRows(m.containers))
+				m.ensureSelection()
 				return m, tea.Batch(m.loadContainers(), scheduleRefresh(m.refreshEvery))
 			}
 		case "s":
@@ -187,11 +206,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	var cmd tea.Cmd
 	m.table, cmd = m.table.Update(msg)
+	if idx := m.table.Cursor(); idx >= 0 && idx < len(m.containers) {
+		m.selectedID = m.containers[idx].ID
+	}
 	return m, cmd
 }
 
 func (m model) View() string {
-	header := lipgloss.JoinHorizontal(lipgloss.Top, titleStyle.Render("DockCrew"), subtitleStyle.Render(statusText(m)))
+	status := statusText(m)
+	if m.fetching {
+		status = fmt.Sprintf("%s %s", m.spinner.View(), status)
+	}
+	header := lipgloss.JoinHorizontal(lipgloss.Top, titleStyle.Render("DockCrew"), subtitleStyle.Render(status))
 	var body string
 	if m.fetching {
 		body = infoStyle.Render("Actualizando contenedores...")
@@ -200,6 +226,15 @@ func (m model) View() string {
 		body = errorStyle.Render("Error: " + m.lastErr.Error())
 	}
 	tableView := m.table.View()
+	if len(m.containers) == 0 && !m.fetching {
+		emptyMsg := "No hay contenedores en ejecución"
+		if !m.showAll {
+			emptyMsg += ". Pulsa 'a' para ver todos."
+		} else {
+			emptyMsg += " ni detenidos."
+		}
+		tableView = lipgloss.JoinVertical(lipgloss.Left, tableView, emptyStateStyle.Render(emptyMsg))
+	}
 	detail := m.renderDetail()
 	notice := m.notificationView()
 	prompt := m.renderPrompt()
@@ -253,8 +288,12 @@ func (m *model) loadContainers() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 		defer cancel()
-		items, err := m.client.ListContainersAll(ctx, m.showAll)
-		return containersMsg{items: items, err: err, all: m.showAll}
+		items, err := m.client.ListContainersAll(ctx, true)
+		if err != nil {
+			return containersMsg{err: err, all: m.showAll}
+		}
+		filtered := filterContainers(items, m.showAll)
+		return containersMsg{items: filtered, snapshot: items, all: m.showAll}
 	}
 }
 
@@ -270,6 +309,7 @@ func (m *model) queueAction(action actionType) tea.Cmd {
 		return nil
 	}
 	m.pendingAction = nil
+	m.applyOptimisticUpdate(action, ct.ID)
 	return m.executeAction(*prompt)
 }
 
@@ -279,6 +319,7 @@ func (m *model) executePendingAction() tea.Cmd {
 	}
 	p := *m.pendingAction
 	m.pendingAction = nil
+	m.applyOptimisticUpdate(p.action, p.container.ID)
 	return m.executeAction(p)
 }
 
@@ -309,9 +350,69 @@ func (m model) selectedContainer() (domain.Container, bool) {
 	}
 	idx := m.table.Cursor()
 	if idx < 0 || idx >= len(m.containers) {
+		if m.selectedID != "" {
+			if idx = findContainerIndex(m.containers, m.selectedID); idx >= 0 {
+				return m.containers[idx], true
+			}
+		}
 		return domain.Container{}, false
 	}
+	m.selectedID = m.containers[idx].ID
 	return m.containers[idx], true
+}
+
+func (m *model) ensureSelection() {
+	if len(m.containers) == 0 {
+		m.selectedID = ""
+		m.table.SetCursor(0)
+		return
+	}
+	if m.selectedID != "" {
+		if idx := findContainerIndex(m.containers, m.selectedID); idx >= 0 {
+			m.table.SetCursor(idx)
+			return
+		}
+	}
+	m.selectedID = m.containers[0].ID
+	m.table.SetCursor(0)
+}
+
+func findContainerIndex(list []domain.Container, id string) int {
+	for i := range list {
+		if list[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m *model) applyOptimisticUpdate(action actionType, id string) {
+	updateList := func(list []domain.Container) []domain.Container {
+		for i := range list {
+			if list[i].ID != id {
+				continue
+			}
+			switch action {
+			case actionStart:
+				list[i].State = "starting"
+				list[i].Status = "Starting..."
+			case actionStop:
+				list[i].State = "stopping"
+				list[i].Status = "Stopping..."
+			case actionRestart:
+				list[i].State = "restarting"
+				list[i].Status = "Restarting..."
+			case actionRemove:
+				list[i].State = "removing"
+				list[i].Status = "Removing..."
+			}
+			break
+		}
+		return list
+	}
+	m.containers = updateList(m.containers)
+	m.allContainers = updateList(m.allContainers)
+	m.table.SetRows(buildRows(m.containers))
 }
 
 func (m *model) flash(msg string, kind notificationKind) {
@@ -370,6 +471,26 @@ func buildRows(containers []domain.Container) []table.Row {
 		})
 	}
 	return rows
+}
+
+func filterContainers(all []domain.Container, showAll bool) []domain.Container {
+	if showAll {
+		return cloneContainers(all)
+	}
+	filtered := make([]domain.Container, 0, len(all))
+	for _, ct := range all {
+		switch strings.ToLower(ct.State) {
+		case "running", "restarting", "starting":
+			filtered = append(filtered, ct)
+		}
+	}
+	return filtered
+}
+
+func cloneContainers(src []domain.Container) []domain.Container {
+	res := make([]domain.Container, len(src))
+	copy(res, src)
+	return res
 }
 
 func relativeTime(ts time.Time) string {
@@ -446,9 +567,14 @@ func formatMap(m map[string]string) string {
 	if len(m) == 0 {
 		return ""
 	}
-	pairs := make([]string, 0, len(m))
-	for k, v := range m {
-		pairs = append(pairs, fmt.Sprintf("%s=%s", k, v))
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	pairs := make([]string, 0, len(keys))
+	for _, k := range keys {
+		pairs = append(pairs, fmt.Sprintf("%s=%s", k, m[k]))
 	}
 	return strings.Join(pairs, ", ")
 }
@@ -509,6 +635,8 @@ var (
 	notificationInfoStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57")).Padding(0, 1)
 	notificationErrorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("124")).Padding(0, 1)
 	promptStyle            = lipgloss.NewStyle().BorderStyle(lipgloss.DoubleBorder()).BorderForeground(lipgloss.Color("63")).Padding(0, 1).MarginTop(1)
+	spinnerStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("105")).MarginRight(1)
+	emptyStateStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).MarginTop(1)
 
 	statusRunning = lipgloss.NewStyle().Foreground(lipgloss.Color("46")).Bold(true)
 	statusStopped = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)
@@ -520,8 +648,10 @@ func tableStyles() table.Styles {
 	s := table.DefaultStyles()
 	s.Header = s.Header.
 		BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("63")).
+		BorderForeground(lipgloss.Color("60")).
 		BorderBottom(true).
+		Foreground(lipgloss.Color("231")).
+		Background(lipgloss.Color("60")).
 		Bold(true)
 	s.Selected = s.Selected.
 		Foreground(lipgloss.Color("229")).
